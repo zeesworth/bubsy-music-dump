@@ -166,6 +166,7 @@ def read_msg(f:BinaryIO) -> SeqMsg:
     return msg
 
 def read_seq(f:BinaryIO, addr:int, song_i:int):
+    print(f"read seq {song_i}...")
     seq = SeqRecord()
 
     f.seek(addr)
@@ -184,23 +185,23 @@ def read_seq(f:BinaryIO, addr:int, song_i:int):
 
     # post-process messages so that they're good in MIDI
     tick_pos = 0
-    track_i:dict[str, MidiTrack] = {}
-    track_progs = [-1 for _ in range(16)]
+    tr_map:dict[str, MidiTrack] = {}
+    tr_chan_alloc = 0
+    ch_progs = [-1 for _ in range(16)]
     # so that program changes only kick in right when they're needed and don't screw anything up
-    track_progs_queued = [-1 for _ in range(16)]
+    ch_progs_q = [-1 for _ in range(16)]
 
     # scan ahead to see what the first program change event is
     # so that there aren't any issues caused by mismatched event orders
     for i,msg in enumerate(seq.msgs):
-        if (msg.event == SeqMsgEvent.PROGRAM_SET and track_progs[msg.channel] == -1):
-            track_progs[msg.channel] = msg.program
-            track_progs_queued[msg.channel] = msg.program
+        if (msg.event == SeqMsgEvent.PROGRAM_SET and ch_progs[msg.channel] == -1):
+            ch_progs[msg.channel] = msg.program
+            ch_progs_q[msg.channel] = msg.program
 
-    # split the messages by channel and program so that it's easier to reason with in a DAW
+    # split the messages by program so that it's easier to reason with in a DAW
     for i,msg in enumerate(seq.msgs):
         midi_msg = MidiMsg()
-        midi_msg.event = msg.event
-        midi_msg.channel = msg.channel            
+        midi_msg.event = msg.event        
         midi_msg.note = msg.note
         midi_msg.velo = msg.velo
         midi_msg.loop_end = msg.loop_end
@@ -210,41 +211,57 @@ def read_seq(f:BinaryIO, addr:int, song_i:int):
         tick_pos += msg.delay
 
         if (msg.event == SeqMsgEvent.PROGRAM_SET):
-            track_progs_queued[msg.channel] = msg.program
+            ch_progs_q[msg.channel] = msg.program
             continue
 
         if (msg.event == SeqMsgEvent.NOTE_ON):
-            track_progs[msg.channel] = track_progs_queued[msg.channel]
+            ch_progs[msg.channel] = ch_progs_q[msg.channel]
 
-        track_key = f"{midi_msg.channel}-{track_progs[msg.channel]}"
-        if (track_key not in track_i):
-            new_track = MidiTrack()
-            new_track.channel = msg.channel
+        ch_is_drum = msg.channel == 9
+        tr_map_key = f"{ch_progs[msg.channel]}-{ch_is_drum}"
+        if (tr_map_key in tr_map):
+            track = tr_map[tr_map_key]
+        else:
+            track = MidiTrack()
+            if (not ch_is_drum):
+                # allocate midi channel for this new track
+                track_chan = tr_chan_alloc
+                if (track_chan == 9): track_chan = 10
+
+                if (track_chan >= 16): 
+                    # we have an overflow. wrap around should work
+                    track_chan = 0
+                    
+                tr_chan_alloc = track_chan + 1
+            else:
+                track_chan = 9
+            track.channel = track_chan
 
             # insert track initialization events
             prog_msg = MidiMsg()
             prog_msg.event = SeqMsgEvent.PROGRAM_SET
             # there are some songs that don't set the program before playing a note... what?
-            prog_msg.program = 0 if (track_progs[msg.channel] == -1) else track_progs[msg.channel]
-            prog_msg.channel = msg.channel
+            prog_msg.program = 0 if (ch_progs[msg.channel] == -1) else ch_progs[msg.channel]
+            prog_msg.channel = track_chan
             prog_msg.time = 0
 
             tn_msg = MidiMsg()
             tn_msg.event = SeqMsgEvent.TRACK_NAME
-            if (new_track.channel != 9):
-                tn_msg.text = f"track {len(seq.midi_tracks)} (chn {new_track.channel})"
+            if (not ch_is_drum):
+                tn_msg.text = f"track {len(seq.midi_tracks)}"
             else:
-                tn_msg.text = f"track {len(seq.midi_tracks)} (drums)"
+                tn_msg.text = f"drums"
             tn_msg.channel = msg.channel
             tn_msg.time = 0
 
-            new_track.msgs.append(prog_msg)
-            new_track.msgs.append(tn_msg)
+            track.msgs.append(prog_msg)
+            track.msgs.append(tn_msg)
 
-            seq.midi_tracks.append(new_track)
-            track_i[track_key] = new_track
+            seq.midi_tracks.append(track)
+            tr_map[tr_map_key] = track
 
-        track_i[track_key].msgs.append(midi_msg)
+        midi_msg.channel = track.channel
+        track.msgs.append(midi_msg)
 
     for track in seq.midi_tracks:
         # make sure all tracks end with an end of track event
